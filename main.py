@@ -1,12 +1,11 @@
-# Required: pip install requests openai pdfplumber pytesseract pdf2image pillow
-
 import os
 import requests
 import pdfplumber
 import pytesseract
 from pdf2image import convert_from_path
-from datetime import datetime
+from datetime import datetime, timedelta
 from openai import OpenAI
+from cleanup_text import clean_text
 
 # === CONFIG ===
 with open("keys/openai.txt") as f:
@@ -15,11 +14,8 @@ with open("keys/openai.txt") as f:
 with open("keys/regulation.txt") as f:
     API_KEY = f.read().strip()
 
-print("OPENAI_API_KEY loaded:", bool(OPENAI_API_KEY))
-print("REGULATIONS_API_KEY loaded:", bool(API_KEY))
-
 BASE_URL = "https://api.regulations.gov/v4/comments"
-MAX_RESULTS = 20  # Adjust for more
+MAX_RESULTS = 50  # Adjust for more
 
 # === OpenAI Client ===
 openai_client = OpenAI(api_key=OPENAI_API_KEY)
@@ -34,7 +30,7 @@ def is_from_organization(text):
     )
 
     response = openai_client.chat.completions.create(
-        model="gpt-4",
+        model="gpt-4o-mini",
         messages=[
             {"role": "system", "content": prompt},
             {"role": "user", "content": text[:3000]}
@@ -42,18 +38,24 @@ def is_from_organization(text):
     )
 
     msg = response.choices[0].message.content.strip()
-    print("\n--- GPT Response for Org Check ---")
-    print(msg)
-    print("----------------------------------")
     return "1" in msg
 
 # === Utility to summarize text ===
-def summarize_text(text):
+def summarize_text(text, agency_name, comment_title):
+    prompt = (
+        f"Create a 300-word news story with a headline based on the following letter to the federal agency named '{agency_name}'.\n\n"
+        "For documents from government, college, or public policy groups (including coalitions and alliances): "
+        "Write a news story with stand-alone paragraphs, incorporating direct quotes from the letter's author. "
+        "Avoid using a dateline or acronyms.\n\n"
+        "For documents from business entities: Write a news story with stand-alone paragraphs, incorporating direct "
+        "quotes from the letter's author. Include the city/state of the company filing the comment in the text. Avoid "
+        f"using a dateline or acronyms.\n\nAlso describe the organization(s) involved based on this comment title: {comment_title}"
+    )
     response = openai_client.chat.completions.create(
-        model="gpt-4",
+        model="gpt-4o-mini",
         messages=[
-            {"role": "system", "content": "Summarize this organizational public comment:"},
-            {"role": "user", "content": text[:8000]}  # truncate if needed
+            {"role": "system", "content": prompt},
+            {"role": "user", "content": text[:8000]}
         ]
     )
     return response.choices[0].message.content
@@ -72,9 +74,6 @@ def extract_pdf_text(url):
         print("pdfplumber error:", e)
 
     if text.strip():
-        print("\n--- Extracted PDF Text Preview (from text layer) ---")
-        print(text[:1000])
-        print("----------------------------------")
         os.remove("temp.pdf")
         return text
 
@@ -82,15 +81,11 @@ def extract_pdf_text(url):
     images = convert_from_path("temp.pdf")
     ocr_text = "\n".join([pytesseract.image_to_string(img) for img in images])
     os.remove("temp.pdf")
-    print("\n--- Extracted PDF Text Preview (from OCR) ---")
-    print(ocr_text[:1000])
-    print("----------------------------------")
     return ocr_text
 
 # === Retrieve full comment info (with fallback for attachments) ===
 def fetch_comment_detail(comment_id):
     detail_url = f"{BASE_URL}/{comment_id}?include=attachments&api_key={API_KEY}"
-    print(f"Fetching full comment detail: {detail_url}")
     response = requests.get(detail_url)
     if response.status_code == 200:
         return response.json()
@@ -100,26 +95,27 @@ def fetch_comment_detail(comment_id):
 
 # === Main Process ===
 def fetch_comments_with_attachments():
-    today = datetime.today().strftime("%Y-%m-%d")
-    url = f"{BASE_URL}?filter[postedDate]={today}&include=attachments&page[size]={MAX_RESULTS}&api_key={API_KEY}"
+    yesterday = (datetime.today() - timedelta(days=1)).strftime("%Y-%m-%d")
+    today_date_md = datetime.today().strftime("%B %d")
+    today_date_mdy = datetime.today().strftime("%B %d, %Y")
+    url = f"{BASE_URL}?filter[postedDate]={yesterday}&include=attachments&page[size]={MAX_RESULTS}&api_key={API_KEY}"
     response = requests.get(url)
 
     print("API Status Code:", response.status_code)
-    print("Response JSON keys:", response.json().keys())
 
     data = response.json()
     comments = data.get("data", [])
     included = data.get("included", [])
     attachments = {item["id"]: item for item in included if item["type"] == "attachments"}
 
-    print(f"Total comments retrieved: {len(comments)}")
-    print(f"Total attachments included in payload: {len(attachments)}")
-    print("Attachment IDs from 'included':", list(attachments.keys()))
+    total_checked = 0
+    valid_outputs = 0
 
     for comment in comments:
+        total_checked += 1
         comment_title = comment.get("attributes", {}).get("title", "<No Title>")
+        agency = comment.get("attributes", {}).get("agency", "a federal agency")
         comment_id = comment.get("id")
-        print(f"\n--- Comment Title: {comment_title} ---")
 
         detail_data = fetch_comment_detail(comment_id)
         if not detail_data:
@@ -130,9 +126,7 @@ def fetch_comments_with_attachments():
         detail_attachments = {item["id"]: item for item in included_data if item["type"] == "attachments"}
 
         comment_attachments = comment_data.get("relationships", {}).get("attachments", {}).get("data", [])
-        print(f"Found {len(comment_attachments)} attachments for comment.")
         if not comment_attachments:
-            print("(No relationships -> attachments data block found)")
             continue
 
         for att in comment_attachments:
@@ -146,18 +140,11 @@ def fetch_comments_with_attachments():
                         file_url = fmt["fileUrl"]
                         break
 
-                print("Available file formats:", file_formats)
-                print("Selected file URL:", file_url)
-
                 if not file_url:
-                    print("Skipped: No valid fileUrl found.")
                     continue
 
-                print(f"Downloading attachment: {file_url}")
                 text = extract_pdf_text(file_url)
-                print(f"Extracted text length: {len(text)}")
                 if not text.strip():
-                    print("Skipped: No text extracted from PDF.")
                     continue
 
                 org_keywords = ["llc", "inc", "organization", "institute", "university", "center", "society", "association", "coalition", "agency", "company", "group", "corporation"]
@@ -165,20 +152,31 @@ def fetch_comments_with_attachments():
                 title_has_org = any(word in title_lower for word in org_keywords)
 
                 if title_has_org:
-                    print("Detected organization based on title.")
                     is_org = True
                 else:
-                    print("Title did not clearly indicate an organization. Asking GPT...")
                     is_org = is_from_organization(text)
 
-                print(f"GPT/Heuristic determined organization? {is_org}")
-
                 if is_org:
-                    summary = summarize_text(text)
-                    print("Summary:\n", summary)
-                else:
-                    print("Skipped: Not from organization")
+                    summary = summarize_text(text, agency, comment_title)
+                    lines = summary.strip().split("\n", 1)
+                    headline = lines[0].strip()
+                    body_main = lines[1].strip() if len(lines) > 1 else ""
+                    body = f"WASHINGTON, {today_date_md} -- {body_main}\n\n* * *\n\nRead full text of the public communication here: {file_url}\n\nView Regulations.gov posting on {today_date_mdy} and docket information here: https://www.regulations.gov/comment/{comment_id}."
+                    filename = f"{comment_id}.txt"
+
+                    headline = clean_text(headline)
+                    body = clean_text(body)
+                    filename = clean_text(filename)
+
+                    print("Headline:", headline)
+                    print("Body:", body)
+                    print("Filename would be:", filename)
+
+                    valid_outputs += 1
                 break
+
+    print(f"\nTotal comments checked: {total_checked}")
+    print(f"Valid organization summaries generated: {valid_outputs}")
 
 if __name__ == "__main__":
     fetch_comments_with_attachments()
