@@ -1,9 +1,11 @@
-# Required: pip install requests openai pdfplumber
+# Required: pip install requests openai pdfplumber pytesseract pdf2image pillow
 
 import os
 import requests
 import pdfplumber
-from datetime import datetime, date
+import pytesseract
+from pdf2image import convert_from_path
+from datetime import datetime
 from openai import OpenAI
 
 # === CONFIG ===
@@ -17,7 +19,7 @@ print("OPENAI_API_KEY loaded:", bool(OPENAI_API_KEY))
 print("REGULATIONS_API_KEY loaded:", bool(API_KEY))
 
 BASE_URL = "https://api.regulations.gov/v4/comments"
-MAX_RESULTS = 10  # Adjust for more
+MAX_RESULTS = 20  # Adjust for more
 
 # === OpenAI Client ===
 openai_client = OpenAI(api_key=OPENAI_API_KEY)
@@ -61,13 +63,29 @@ def extract_pdf_text(url):
     response = requests.get(url)
     with open("temp.pdf", "wb") as f:
         f.write(response.content)
-    with pdfplumber.open("temp.pdf") as pdf:
-        text = "\n".join([page.extract_text() for page in pdf.pages if page.extract_text()])
+
+    text = ""
+    try:
+        with pdfplumber.open("temp.pdf") as pdf:
+            text = "\n".join([page.extract_text() for page in pdf.pages if page.extract_text()])
+    except Exception as e:
+        print("pdfplumber error:", e)
+
+    if text.strip():
+        print("\n--- Extracted PDF Text Preview (from text layer) ---")
+        print(text[:1000])
+        print("----------------------------------")
+        os.remove("temp.pdf")
+        return text
+
+    print("Falling back to OCR...")
+    images = convert_from_path("temp.pdf")
+    ocr_text = "\n".join([pytesseract.image_to_string(img) for img in images])
     os.remove("temp.pdf")
-    print("\n--- Extracted PDF Text Preview ---")
-    print(text[:1000])  # print the first 1000 characters for debugging
+    print("\n--- Extracted PDF Text Preview (from OCR) ---")
+    print(ocr_text[:1000])
     print("----------------------------------")
-    return text
+    return ocr_text
 
 # === Retrieve full comment info (with fallback for attachments) ===
 def fetch_comment_detail(comment_id):
@@ -82,7 +100,7 @@ def fetch_comment_detail(comment_id):
 
 # === Main Process ===
 def fetch_comments_with_attachments():
-    today = date.today().isoformat()
+    today = datetime.today().strftime("%Y-%m-%d")
     url = f"{BASE_URL}?filter[postedDate]={today}&include=attachments&page[size]={MAX_RESULTS}&api_key={API_KEY}"
     response = requests.get(url)
 
@@ -103,7 +121,6 @@ def fetch_comments_with_attachments():
         comment_id = comment.get("id")
         print(f"\n--- Comment Title: {comment_title} ---")
 
-        # Fallback: re-fetch full comment details for attachment check
         detail_data = fetch_comment_detail(comment_id)
         if not detail_data:
             continue
@@ -143,7 +160,6 @@ def fetch_comments_with_attachments():
                     print("Skipped: No text extracted from PDF.")
                     continue
 
-                # Heuristic check on the comment title
                 org_keywords = ["llc", "inc", "organization", "institute", "university", "center", "society", "association", "coalition", "agency", "company", "group", "corporation"]
                 title_lower = comment_title.lower()
                 title_has_org = any(word in title_lower for word in org_keywords)
@@ -162,7 +178,7 @@ def fetch_comments_with_attachments():
                     print("Summary:\n", summary)
                 else:
                     print("Skipped: Not from organization")
-                break  # only handle one attachment per comment for now
+                break
 
 if __name__ == "__main__":
     fetch_comments_with_attachments()
