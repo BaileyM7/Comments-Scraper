@@ -1,0 +1,4 @@
+List Of invalid pdfs:
+
+https://downloads.regulations.gov/FINCEN-2025-0001-0081/attachment_1.pdf
+-because the doc ints too anybody
